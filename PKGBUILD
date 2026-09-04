@@ -5,7 +5,7 @@
 pkgname=libfprint-pxat-driver-git
 _pkgname=libfprint
 pkgver=1.94.100
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers with patches for the support of the PXAT PT2887-CI"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
@@ -22,7 +22,7 @@ source=(
 )
 sha256sums=(
   'SKIP'
-  'd24574540bff5eebd22100a1312ea047a3d8a7c45415d5f510ad0f8884f56140'
+  '0624a48f49559458d8ccd704dceae75b2dd6a1290580e5ddd6cf96ce13e9c245'
 )
 
 pkgver() {

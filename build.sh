@@ -12,4 +12,4 @@ podman run --rm -it \
     -v "$PWD:/build:Z" \
 	 -w /build \
     "$IMAGE" \
-    makepkg -s --noconfirm
+    makepkg -s -C --noconfirm
