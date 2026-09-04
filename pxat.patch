@@ -8,10 +8,10 @@ index 0000000..99ef037
 +drivers_sources += files('pxat.c')
 diff --git a/libfprint/drivers/pxat/pxat.c b/libfprint/drivers/pxat/pxat.c
 new file mode 100644
-index 0000000..227521f
+index 0000000..0035d69
 --- /dev/null
 +++ b/libfprint/drivers/pxat/pxat.c
-@@ -0,0 +1,1877 @@
+@@ -0,0 +1,1818 @@
 +/*
 + * Copyright (C) 2026 Colin Cheng <zbinlin@outlook.com>
 + *
@@ -100,8 +100,6 @@ index 0000000..227521f
 +
 +#define PXAT_USB_TIMEOUT_MS               2000u
 +#define PXAT_POLL_MS                      120
-+#define PXAT_ENROLL_TIMEOUT_MS            60000u
-+#define PXAT_VERIFY_TIMEOUT_MS            30000u
 +#define PXAT_MAX_RESPONSE                 4096u
 +#define PXAT_MAX_PAYLOAD_LEN              512u
 +#define PXAT_RECORD_TAG                   "PXAT-slot:"
@@ -147,8 +145,7 @@ index 0000000..227521f
 +  FpiDeviceAction      operation;
 +
 +  FpiSsm              *ssm;
-+  FpiSsm              *cancel_ssm;
-+  GSource             *operation_timeout;
++  FpiSsm              *cleanup_ssm;
 +  gboolean             command_active;
 +  gboolean             cancel_requested;
 +  GError              *cleanup_error;
@@ -607,28 +604,18 @@ index 0000000..227521f
 +}
 +
 +static void
-+pxat_cancel_operation_timeout (FpiDevicePxat *self)
-+{
-+  if (self->operation_timeout)
-+    {
-+      g_source_destroy (self->operation_timeout);
-+      self->operation_timeout = NULL;
-+    }
-+}
-+
-+static void
-+pxat_cancel_cleanup_done (FpiSsm   *ssm,
-+                          FpDevice *device,
-+                          GError   *error)
++pxat_cleanup_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +  FpiDeviceAction action = self->operation;
 +  (void) ssm;
 +
-+  self->cancel_ssm = NULL;
-+  pxat_cancel_operation_timeout (self);
++  self->cleanup_ssm = NULL;
++
 +  if (error)
-+    fp_warn ("PXAT abort during cancellation failed: %s", error->message);
++    fp_warn ("PXAT 0xF2 abort during cleanup failed: %s", error->message);
 +
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->last_state = 0;
@@ -665,25 +652,24 @@ index 0000000..227521f
 +}
 +
 +static void
-+pxat_start_cancel_cleanup (FpiDevicePxat *self,
-+                           FpDevice       *device)
++pxat_start_abort_cleanup (FpiDevicePxat *self,
++                          FpDevice       *device)
 +{
-+  if (self->cancel_ssm)
++  if (self->cleanup_ssm)
 +    return;
 +
-+  self->cancel_ssm = pxat_cmd_ssm_new (device,
-+                                       PXAT_CMD_ABORT,
-+                                       NULL,
-+                                       0,
-+                                       TRUE,
-+                                       FALSE);
-+  if (!self->cancel_ssm)
++  self->cleanup_ssm = pxat_cmd_ssm_new (device,
++                                        PXAT_CMD_ABORT,
++                                        NULL,
++                                        0,
++                                        TRUE,
++                                        FALSE);
++  if (!self->cleanup_ssm)
 +    {
 +      FpiDeviceAction action = self->operation;
 +
 +      self->operation = FPI_DEVICE_ACTION_NONE;
 +      self->cancel_requested = FALSE;
-+      pxat_cancel_operation_timeout (self);
 +
 +      if (action == FPI_DEVICE_ACTION_ENROLL)
 +        fpi_device_enroll_complete (device,
@@ -700,63 +686,17 @@ index 0000000..227521f
 +      return;
 +    }
 +
-+  fp_dbg ("PXAT cancellation cleanup: sending F2 without action cancellable");
-+  fpi_ssm_start (self->cancel_ssm, pxat_cancel_cleanup_done);
-+}
-+
-+static void
-+pxat_operation_timeout_cb (FpDevice *device,
-+                           gpointer  user_data)
-+{
-+  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
-+  FpiSsm *ssm = self->ssm;
-+  (void) user_data;
-+
-+  self->operation_timeout = NULL;
-+
-+  /* Guard against timeout racing with user-initiated cancellation */
-+  if (self->cancel_requested || !ssm || self->operation == FPI_DEVICE_ACTION_NONE)
-+    return;
-+
-+  fp_dbg ("PXAT interactive operation timed out");
-+
-+  if (self->command_active)
-+    {
-+      GCancellable *cancellable = fpi_device_get_cancellable (device);
-+      if (cancellable)
-+        g_cancellable_cancel (cancellable);
-+      return;
-+    }
-+
-+  fpi_ssm_mark_failed (ssm,
-+                       g_error_new (G_IO_ERROR,
-+                                    G_IO_ERROR_TIMED_OUT,
-+                                    "PXAT fingerprint operation timed out"));
-+}
-+
-+static void
-+pxat_start_operation_timeout (FpiDevicePxat *self,
-+                              FpDevice       *device,
-+                              guint           timeout_ms)
-+{
-+  pxat_cancel_operation_timeout (self);
-+  self->operation_timeout = fpi_device_add_timeout (device,
-+                                                    (gint) timeout_ms,
-+                                                    pxat_operation_timeout_cb,
-+                                                    NULL,
-+                                                    NULL);
++  fp_dbg ("PXAT cleanup: sending F2 abort to ensure hardware IDLE");
++  fpi_ssm_start (self->cleanup_ssm, pxat_cleanup_done);
 +}
 +
 +static void
 +pxat_finish_enroll (FpiDevicePxat *self,
-+                    FpDevice       *device,
-+                    GError         *error)
++                    FpDevice       *device)
 +{
 +  FpPrint *print = NULL;
 +
-+  pxat_cancel_operation_timeout (self);
-+
-+  if (!error && self->enroll_print)
++  if (self->enroll_print)
 +    print = g_object_ref (self->enroll_print);
 +
 +  self->ssm = NULL;
@@ -766,39 +706,33 @@ index 0000000..227521f
 +  self->enroll_slot = 0;
 +  self->enroll_print = NULL;
 +
-+  fpi_device_enroll_complete (device, print, error);
++  fpi_device_enroll_complete (device, print, NULL);
 +}
 +
 +static void
 +pxat_finish_verify (FpiDevicePxat *self,
-+                    FpDevice       *device,
-+                    GError         *error)
++                    FpDevice       *device)
 +{
-+  pxat_cancel_operation_timeout (self);
-+
 +  self->ssm = NULL;
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->last_state = 0;
 +  self->command_active = FALSE;
 +  self->verify_print = NULL;
 +
-+  fpi_device_verify_complete (device, error);
++  fpi_device_verify_complete (device, NULL);
 +}
 +
 +static void
 +pxat_finish_identify (FpiDevicePxat *self,
-+                      FpDevice       *device,
-+                      GError         *error)
++                      FpDevice       *device)
 +{
-+  pxat_cancel_operation_timeout (self);
-+
 +  self->ssm = NULL;
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->last_state = 0;
 +  self->command_active = FALSE;
 +  self->identify_gallery = NULL;
 +
-+  fpi_device_identify_complete (device, error);
++  fpi_device_identify_complete (device, NULL);
 +}
 +
 +static void
@@ -903,20 +837,21 @@ index 0000000..227521f
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
 +  self->ssm = NULL;
-+  if (self->cancel_requested)
++
++  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
++  if (self->cancel_requested || error != NULL)
 +    {
 +      if (!self->cleanup_error)
-+        self->cleanup_error = g_error_new (G_IO_ERROR,
-+                                           G_IO_ERROR_CANCELLED,
-+                                           "PXAT fingerprint operation cancelled");
-+      pxat_start_cancel_cleanup (self, device);
++        self->cleanup_error = g_steal_pointer (&error);
++      else
++        g_clear_error (&error);
++
++      pxat_start_abort_cleanup (self, device);
 +      return;
 +    }
 +
-+  if (error)
-+    pxat_finish_enroll (self, device, g_steal_pointer (&error));
-+  else if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_enroll (self, device, NULL);
++  if (self->operation != FPI_DEVICE_ACTION_NONE)
++    pxat_finish_enroll (self, device);
 +}
 +
 +static void
@@ -1085,16 +1020,14 @@ index 0000000..227521f
 +
 +          case PXAT_STATE_ENROLL_ABORTED:
 +            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
-+            if (!self->cancel_requested)
-+              fpi_ssm_mark_failed (ssm,
-+                                   g_error_new (G_IO_ERROR,
-+                                                G_IO_ERROR_TIMED_OUT,
-+                                                "PXAT enrollment aborted by sensor"));
++            fpi_ssm_mark_failed (ssm,
++                                 g_error_new (G_IO_ERROR,
++                                              G_IO_ERROR_TIMED_OUT,
++                                              "PXAT enrollment aborted by sensor"));
 +            return;
 +
 +          case PXAT_STATE_ENROLL_SUCCESS:
 +            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
-+            /* Notify upper-layer stack that stage 1 is completed */
 +            fpi_device_enroll_progress (device, 1, self->enroll_print, NULL);
 +            fpi_ssm_mark_completed (ssm);
 +            return;
@@ -1132,20 +1065,21 @@ index 0000000..227521f
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
 +  self->ssm = NULL;
-+  if (self->cancel_requested)
++
++  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
++  if (self->cancel_requested || error != NULL)
 +    {
 +      if (!self->cleanup_error)
-+        self->cleanup_error = g_error_new (G_IO_ERROR,
-+                                           G_IO_ERROR_CANCELLED,
-+                                           "PXAT fingerprint operation cancelled");
-+      pxat_start_cancel_cleanup (self, device);
++        self->cleanup_error = g_steal_pointer (&error);
++      else
++        g_clear_error (&error);
++
++      pxat_start_abort_cleanup (self, device);
 +      return;
 +    }
 +
-+  if (error)
-+    pxat_finish_verify (self, device, g_steal_pointer (&error));
-+  else if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_verify (self, device, NULL);
++  if (self->operation != FPI_DEVICE_ACTION_NONE)
++    pxat_finish_verify (self, device);
 +}
 +
 +static void
@@ -1158,7 +1092,6 @@ index 0000000..227521f
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case PXAT_VERIFY_ABORT:
-+      /* Pre-reset sensor MCU state to clean up residual interrupts */
 +      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
 +      break;
 +
@@ -1295,20 +1228,21 @@ index 0000000..227521f
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
 +  self->ssm = NULL;
-+  if (self->cancel_requested)
++
++  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
++  if (self->cancel_requested || error != NULL)
 +    {
 +      if (!self->cleanup_error)
-+        self->cleanup_error = g_error_new (G_IO_ERROR,
-+                                           G_IO_ERROR_CANCELLED,
-+                                           "PXAT fingerprint operation cancelled");
-+      pxat_start_cancel_cleanup (self, device);
++        self->cleanup_error = g_steal_pointer (&error);
++      else
++        g_clear_error (&error);
++
++      pxat_start_abort_cleanup (self, device);
 +      return;
 +    }
 +
-+  if (error)
-+    pxat_finish_identify (self, device, g_steal_pointer (&error));
-+  else if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_identify (self, device, NULL);
++  if (self->operation != FPI_DEVICE_ACTION_NONE)
++    pxat_finish_identify (self, device);
 +}
 +
 +static void
@@ -1321,7 +1255,6 @@ index 0000000..227521f
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case PXAT_IDENTIFY_ABORT:
-+      /* Pre-reset sensor MCU state to clean up residual interrupts */
 +      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
 +      break;
 +
@@ -1336,6 +1269,7 @@ index 0000000..227521f
 +
 +        if (!self->identify_gallery || self->identify_gallery->len == 0)
 +          {
++            fp_dbg ("PXAT identify gallery is empty, reporting no match");
 +            fpi_device_identify_report (device, NULL, NULL, NULL);
 +            fpi_ssm_mark_completed (ssm);
 +            return;
@@ -1660,7 +1594,6 @@ index 0000000..227521f
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
-+  pxat_cancel_operation_timeout (self);
 +  self->command_active = FALSE;
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->enroll_print = NULL;
@@ -1715,7 +1648,8 @@ index 0000000..227521f
 +
 +  self->ssm = fpi_ssm_new (device, pxat_enroll_ssm_handler, PXAT_ENROLL_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+  pxat_start_operation_timeout (self, device, PXAT_ENROLL_TIMEOUT_MS);
++
++  /* Enrollment lifecycle is exclusively managed by client cancellable & sensor 0xE3 */
 +  fpi_ssm_start (self->ssm, pxat_enroll_ssm_done);
 +}
 +
@@ -1752,7 +1686,8 @@ index 0000000..227521f
 +
 +  self->ssm = fpi_ssm_new (device, pxat_verify_ssm_handler, PXAT_VERIFY_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+  pxat_start_operation_timeout (self, device, PXAT_VERIFY_TIMEOUT_MS);
++
++  /* Verify timeout is exclusively managed by fprintd/client cancellable */
 +  fpi_ssm_start (self->ssm, pxat_verify_ssm_done);
 +}
 +
@@ -1765,6 +1700,8 @@ index 0000000..227521f
 +    self->model = pxat_get_model (device);
 +
 +  fpi_device_get_identify_data (device, &self->identify_gallery);
++
++  /* Handle empty gallery directly without touching hardware */
 +  if (!self->identify_gallery || self->identify_gallery->len == 0)
 +    {
 +      fp_dbg ("PXAT identify gallery is empty, reporting no match directly");
@@ -1783,7 +1720,8 @@ index 0000000..227521f
 +
 +  self->ssm = fpi_ssm_new (device, pxat_identify_ssm_handler, PXAT_IDENTIFY_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+  pxat_start_operation_timeout (self, device, PXAT_VERIFY_TIMEOUT_MS);
++
++  /* Identify timeout is exclusively managed by fprintd/client cancellable */
 +  fpi_ssm_start (self->ssm, pxat_identify_ssm_done);
 +}
 +
@@ -1825,9 +1763,13 @@ index 0000000..227521f
 +  if (self->cancel_requested)
 +    return;
 +
-+  fp_dbg ("PXAT cancel requested");
++  fp_dbg ("PXAT cancel requested by caller");
 +  self->cancel_requested = TRUE;
-+  pxat_cancel_operation_timeout (self);
++
++  if (!self->cleanup_error)
++    self->cleanup_error = g_error_new (G_IO_ERROR,
++                                       G_IO_ERROR_CANCELLED,
++                                       "PXAT fingerprint operation cancelled");
 +
 +  fpi_ssm_cancel_delayed_state_change (self->ssm);
 +
@@ -1879,8 +1821,7 @@ index 0000000..227521f
 +  self->last_state = 0;
 +  self->enroll_slot = 0;
 +  self->ssm = NULL;
-+  self->cancel_ssm = NULL;
-+  self->operation_timeout = NULL;
++  self->cleanup_ssm = NULL;
 +  self->command_active = FALSE;
 +  self->cancel_requested = FALSE;
 +  self->cleanup_error = NULL;
