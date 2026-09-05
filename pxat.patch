@@ -8,10 +8,10 @@ index 0000000..99ef037
 +drivers_sources += files('pxat.c')
 diff --git a/libfprint/drivers/pxat/pxat.c b/libfprint/drivers/pxat/pxat.c
 new file mode 100644
-index 0000000..0035d69
+index 0000000..9561064
 --- /dev/null
 +++ b/libfprint/drivers/pxat/pxat.c
-@@ -0,0 +1,1818 @@
+@@ -0,0 +1,2097 @@
 +/*
 + * Copyright (C) 2026 Colin Cheng <zbinlin@outlook.com>
 + *
@@ -119,6 +119,9 @@ index 0000000..0035d69
 +  guint        slot_first;
 +  guint        slot_count;
 +  guint        inter_cmd_delay_ms;
++  guint        enroll_timeout_ms;
++  guint        verify_timeout_ms;
++  guint        identify_timeout_ms;
 +} PxatModelDesc;
 +
 +static const PxatModelDesc pxat_models[] =
@@ -130,6 +133,9 @@ index 0000000..0035d69
 +    .slot_first = 10,
 +    .slot_count = 10,
 +    .inter_cmd_delay_ms = 100,
++    .enroll_timeout_ms = 60000,
++    .verify_timeout_ms = 30000,
++    .identify_timeout_ms = 30000,
 +  },
 +};
 +
@@ -146,7 +152,10 @@ index 0000000..0035d69
 +
 +  FpiSsm              *ssm;
 +  FpiSsm              *cleanup_ssm;
++  /* TRUE only while a PXAT USB OUT/IN transfer is in flight. */
 +  gboolean             command_active;
++  GSource             *operation_timeout_source;
++  gboolean             operation_timed_out;
 +  gboolean             cancel_requested;
 +  GError              *cleanup_error;
 +  GBytes              *last_response;
@@ -261,15 +270,30 @@ index 0000000..0035d69
 +{
 +  FpiDevicePxat *self;
 +  guint8         command;
++  guint          delay_ms;
 +  gboolean       check_status;
 +  gboolean       use_action_cancellable;
 +  GBytes        *frame;
++  GError        *pending_error;
 +} PxatCmdCtx;
 +
++/*
++ * Every PXAT command is one transaction:
++ *
++ *     OUT -> IN -> inter-command delay -> DONE
++ *
++ * A failed/cancelled USB transaction follows the same delay path before the
++ * child SSM reports failure, so cleanup never needs a timestamp-based delay.
++ *
++ * The delay belongs to the command itself.  Therefore a parent SSM can
++ * start its next PXAT command immediately when this child completes, and
++ * the protocol timing remains correct without tracking wall-clock state.
++ */
 +enum
 +{
 +  PXAT_CMD_STATE_OUT,
 +  PXAT_CMD_STATE_IN,
++  PXAT_CMD_STATE_DELAY,
 +  PXAT_CMD_STATE_DONE,
 +  PXAT_CMD_STATE_N_STATES,
 +};
@@ -278,6 +302,7 @@ index 0000000..0035d69
 +pxat_cmd_ctx_free (PxatCmdCtx *ctx)
 +{
 +  g_clear_pointer (&ctx->frame, g_bytes_unref);
++  g_clear_error (&ctx->pending_error);
 +  g_free (ctx);
 +}
 +
@@ -386,10 +411,12 @@ index 0000000..0035d69
 +  (void) transfer;
 +  (void) device;
 +
++  ctx->self->command_active = FALSE;
++
 +  if (error)
 +    {
-+      ctx->self->command_active = FALSE;
-+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++      ctx->pending_error = g_steal_pointer (&error);
++      fpi_ssm_jump_to_state (ssm, PXAT_CMD_STATE_DELAY);
 +      return;
 +    }
 +
@@ -410,10 +437,13 @@ index 0000000..0035d69
 +  gsize rx_len = 0;
 +  (void) device;
 +
++  ctx->self->command_active = FALSE;
++
++  /* Whatever happens on IN, the next PXAT command must wait. */
 +  if (error)
 +    {
-+      ctx->self->command_active = FALSE;
-+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++      ctx->pending_error = g_steal_pointer (&error);
++      fpi_ssm_next_state (ssm);
 +      return;
 +    }
 +
@@ -422,19 +452,18 @@ index 0000000..0035d69
 +                                   &payload,
 +                                   &parse_error))
 +    {
-+      ctx->self->command_active = FALSE;
-+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&parse_error));
++      ctx->pending_error = g_steal_pointer (&parse_error);
++      fpi_ssm_next_state (ssm);
 +      return;
 +    }
 +
 +  if (ctx->check_status && !pxat_response_status_ok (payload, &parse_error))
 +    {
-+      ctx->self->command_active = FALSE;
-+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&parse_error));
++      ctx->pending_error = g_steal_pointer (&parse_error);
++      fpi_ssm_next_state (ssm);
 +      return;
 +    }
 +
-+  ctx->self->command_active = FALSE;
 +  g_clear_pointer (&ctx->self->last_response, g_bytes_unref);
 +  ctx->self->last_response = g_steal_pointer (&payload);
 +
@@ -467,6 +496,7 @@ index 0000000..0035d69
 +        data = g_bytes_get_data (ctx->frame, &len);
 +        out_buf = g_memdup2 (data, len);
 +
++        self->command_active = TRUE;
 +        transfer = fpi_usb_transfer_new (device);
 +        transfer->ssm = ssm;
 +        fpi_usb_transfer_fill_bulk_full (transfer,
@@ -485,6 +515,7 @@ index 0000000..0035d69
 +    case PXAT_CMD_STATE_IN:
 +      {
 +        FpiUsbTransfer *transfer = fpi_usb_transfer_new (device);
++        self->command_active = TRUE;
 +        transfer->ssm = ssm;
 +        fpi_usb_transfer_fill_bulk (transfer, self->model->ep_in, PXAT_MAX_RESPONSE);
 +        fpi_usb_transfer_submit (transfer,
@@ -495,8 +526,19 @@ index 0000000..0035d69
 +      }
 +      break;
 +
++    case PXAT_CMD_STATE_DELAY:
++      if (ctx->delay_ms > 0)
++        fpi_ssm_next_state_delayed (ssm, ctx->delay_ms);
++      else
++        fpi_ssm_next_state (ssm);
++      ctx->delay_ms = 0;
++      break;
++
 +    case PXAT_CMD_STATE_DONE:
-+      fpi_ssm_mark_completed (ssm);
++      if (ctx->pending_error)
++        fpi_ssm_mark_failed (ssm, g_steal_pointer (&ctx->pending_error));
++      else
++        fpi_ssm_mark_completed (ssm);
 +      break;
 +
 +    default:
@@ -506,11 +548,12 @@ index 0000000..0035d69
 +
 +static FpiSsm *
 +pxat_cmd_ssm_new (FpDevice     *device,
-+                  guint8        command,
-+                  const guint8 *data,
-+                  gsize         data_len,
-+                  gboolean      check_status,
-+                  gboolean      use_action_cancellable)
++                 guint8        command,
++                 const guint8 *data,
++                 gsize         data_len,
++                 guint          delay_ms,
++                 gboolean      check_status,
++                 gboolean      use_action_cancellable)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +  PxatCmdCtx *ctx = g_new0 (PxatCmdCtx, 1);
@@ -522,6 +565,7 @@ index 0000000..0035d69
 +
 +  ctx->self = self;
 +  ctx->command = command;
++  ctx->delay_ms = delay_ms;
 +  ctx->check_status = check_status;
 +  ctx->use_action_cancellable = use_action_cancellable;
 +
@@ -532,7 +576,10 @@ index 0000000..0035d69
 +      return NULL;
 +    }
 +
-+  fp_dbg ("PXAT TX cmd=0x%02x frame_len=%zu", command, g_bytes_get_size (ctx->frame));
++  fp_dbg ("PXAT TX cmd=0x%02x frame_len=%zu delay=%ums",
++          command,
++          g_bytes_get_size (ctx->frame),
++          delay_ms);
 +
 +  ssm = fpi_ssm_new (device, pxat_cmd_ssm_handler, PXAT_CMD_STATE_N_STATES);
 +  fpi_ssm_set_data (ssm, ctx, (GDestroyNotify) pxat_cmd_ctx_free);
@@ -545,9 +592,18 @@ index 0000000..0035d69
 +                      guint8        command,
 +                      const guint8 *data,
 +                      gsize         data_len,
-+                      gboolean      check_status)
++                      guint          delay_ms,
++                      gboolean      check_status,
++                      gboolean      use_action_cancellable)
 +{
-+  FpiSsm *child = pxat_cmd_ssm_new (device, command, data, data_len, check_status, TRUE);
++  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++  FpiSsm *child = pxat_cmd_ssm_new (device,
++                                    command,
++                                    data,
++                                    data_len,
++                                    delay_ms,
++                                    check_status,
++                                    use_action_cancellable);
 +
 +  if (!child)
 +    {
@@ -558,10 +614,64 @@ index 0000000..0035d69
 +      return FALSE;
 +    }
 +
-+  g_clear_pointer (&FPI_DEVICE_PXAT (device)->last_response, g_bytes_unref);
-+  FPI_DEVICE_PXAT (device)->command_active = TRUE;
++  g_clear_pointer (&self->last_response, g_bytes_unref);
++  self->command_active = FALSE;
 +  fpi_ssm_start_subsm (parent, child);
 +  return TRUE;
++}
++
++static gboolean
++pxat_start_normal_cmd (FpiSsm       *parent,
++                        FpDevice     *device,
++                        guint8        command,
++                        const guint8 *data,
++                        gsize         data_len,
++                        gboolean      check_status)
++{
++  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++
++  return pxat_start_cmd_subsm (parent,
++                               device,
++                               command,
++                               data,
++                               data_len,
++                               self->model->inter_cmd_delay_ms,
++                               check_status,
++                               TRUE);
++}
++
++static gboolean
++pxat_start_poll_cmd (FpiSsm       *parent,
++                     FpDevice     *device,
++                     guint8        command)
++{
++  return pxat_start_cmd_subsm (parent,
++                               device,
++                               command,
++                               NULL,
++                               0,
++                               PXAT_POLL_MS,
++                               FALSE,
++                               TRUE);
++}
++
++static gboolean
++pxat_start_cleanup_cmd (FpiSsm       *parent,
++                        FpDevice     *device,
++                        guint8        command)
++{
++  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++
++  /* F2 is a cleanup transaction: it is uncancellable, and the preceding
++   * command has already completed its mandatory transaction delay. */
++  return pxat_start_cmd_subsm (parent,
++                               device,
++                               command,
++                               NULL,
++                               0,
++                               self->model->inter_cmd_delay_ms,
++                               TRUE,
++                               FALSE);
 +}
 +
 +static gchar *
@@ -604,6 +714,121 @@ index 0000000..0035d69
 +}
 +
 +static void
++pxat_cancel_operation_timeout (FpiDevicePxat *self)
++{
++  if (!self->operation_timeout_source)
++    return;
++
++  g_source_destroy (self->operation_timeout_source);
++  self->operation_timeout_source = NULL;
++}
++
++static void
++pxat_operation_timeout_cb (FpDevice *device,
++                            gpointer  user_data)
++{
++  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++  (void) user_data;
++
++  self->operation_timeout_source = NULL;
++  self->operation_timed_out = TRUE;
++
++  if (!self->cleanup_error)
++    self->cleanup_error = g_error_new (G_IO_ERROR,
++                                       G_IO_ERROR_TIMED_OUT,
++                                       "PXAT fingerprint operation timed out");
++
++  fp_warn ("PXAT %s operation timed out",
++           self->operation == FPI_DEVICE_ACTION_ENROLL ? "enroll" :
++           self->operation == FPI_DEVICE_ACTION_VERIFY ? "verify" :
++           self->operation == FPI_DEVICE_ACTION_IDENTIFY ? "identify" :
++           "unknown");
++
++  /* Stop an in-flight USB transaction promptly. If the command SSM is only
++   * in its inter-command delay, the child is allowed to finish that delay and
++   * the action SSM notices operation_timed_out when control returns to it. */
++  {
++    GCancellable *cancellable = fpi_device_get_cancellable (device);
++    if (cancellable)
++      g_cancellable_cancel (cancellable);
++  }
++}
++
++static void
++pxat_start_operation_timeout (FpiDevicePxat *self,
++                              FpDevice       *device,
++                              guint           timeout_ms)
++{
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
++
++  if (timeout_ms == 0)
++    return;
++
++  self->operation_timeout_source = fpi_device_add_timeout (device,
++                                                             (gint) timeout_ms,
++                                                             pxat_operation_timeout_cb,
++                                                             NULL,
++                                                             NULL);
++}
++
++enum
++{
++  PXAT_CLEANUP_F2,
++  PXAT_CLEANUP_DONE,
++  PXAT_CLEANUP_N_STATES,
++};
++
++/* Complete a naturally successful operation.  No F2 is sent here: the
++ * sensor has already left its active operation state on a terminal E1/F1/F2
++ * response. */
++static void
++pxat_complete_success (FpiDevicePxat *self,
++                       FpDevice       *device,
++                       FpiDeviceAction action)
++{
++  g_autoptr(FpPrint) enroll_print = NULL;
++
++  /* The enrollment print is borrowed from fpi_device_get_enroll_data(), so
++   * take our own reference before clearing the operation state. */
++  if (action == FPI_DEVICE_ACTION_ENROLL && self->enroll_print)
++    enroll_print = g_object_ref (self->enroll_print);
++
++  self->operation = FPI_DEVICE_ACTION_NONE;
++  self->last_state = 0;
++  self->command_active = FALSE;
++  self->enroll_slot = 0;
++  self->enroll_print = NULL;
++  self->verify_print = NULL;
++  self->identify_gallery = NULL;
++  self->cancel_requested = FALSE;
++  self->operation_timed_out = FALSE;
++  g_clear_error (&self->cleanup_error);
++  g_clear_pointer (&self->last_response, g_bytes_unref);
++
++  fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
++
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    {
++      fpi_device_enroll_complete (device,
++                                   g_steal_pointer (&enroll_print),
++                                   NULL);
++    }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      fpi_device_verify_complete (device, NULL);
++    }
++  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      fpi_device_identify_complete (device, NULL);
++    }
++  else
++    {
++      g_assert_not_reached ();
++    }
++}
++
++static void
 +pxat_cleanup_done (FpiSsm   *ssm,
 +                   FpDevice *device,
 +                   GError   *error)
@@ -615,7 +840,17 @@ index 0000000..0035d69
 +  self->cleanup_ssm = NULL;
 +
 +  if (error)
-+    fp_warn ("PXAT 0xF2 abort during cleanup failed: %s", error->message);
++    {
++      fp_warn ("PXAT 0xF2 abort during cleanup failed: %s", error->message);
++
++      /* Cleanup is only used after an abnormal operation. Preserve the
++       * original operation error when there is one; otherwise the cleanup
++       * error becomes the result. */
++      if (!self->cleanup_error)
++        self->cleanup_error = g_steal_pointer (&error);
++      else
++        g_clear_error (&error);
++    }
 +
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->last_state = 0;
@@ -625,6 +860,7 @@ index 0000000..0035d69
 +  self->verify_print = NULL;
 +  self->identify_gallery = NULL;
 +  self->cancel_requested = FALSE;
++  self->operation_timed_out = FALSE;
 +
 +  if (action == FPI_DEVICE_ACTION_ENROLL)
 +    {
@@ -649,6 +885,27 @@ index 0000000..0035d69
 +    {
 +      g_clear_error (&self->cleanup_error);
 +    }
++
++  g_clear_pointer (&self->last_response, g_bytes_unref);
++}
++
++static void
++pxat_cleanup_ssm_handler (FpiSsm   *ssm,
++                          FpDevice *device)
++{
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case PXAT_CLEANUP_F2:
++      pxat_start_cleanup_cmd (ssm, device, PXAT_CMD_ABORT);
++      break;
++
++    case PXAT_CLEANUP_DONE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
 +}
 +
 +static void
@@ -658,81 +915,12 @@ index 0000000..0035d69
 +  if (self->cleanup_ssm)
 +    return;
 +
-+  self->cleanup_ssm = pxat_cmd_ssm_new (device,
-+                                        PXAT_CMD_ABORT,
-+                                        NULL,
-+                                        0,
-+                                        TRUE,
-+                                        FALSE);
-+  if (!self->cleanup_ssm)
-+    {
-+      FpiDeviceAction action = self->operation;
++  self->cleanup_ssm = fpi_ssm_new (device,
++                                   pxat_cleanup_ssm_handler,
++                                   PXAT_CLEANUP_N_STATES);
 +
-+      self->operation = FPI_DEVICE_ACTION_NONE;
-+      self->cancel_requested = FALSE;
-+
-+      if (action == FPI_DEVICE_ACTION_ENROLL)
-+        fpi_device_enroll_complete (device,
-+                                    NULL,
-+                                    g_steal_pointer (&self->cleanup_error));
-+      else if (action == FPI_DEVICE_ACTION_VERIFY)
-+        fpi_device_verify_complete (device,
-+                                    g_steal_pointer (&self->cleanup_error));
-+      else if (action == FPI_DEVICE_ACTION_IDENTIFY)
-+        fpi_device_identify_complete (device,
-+                                      g_steal_pointer (&self->cleanup_error));
-+      else
-+        g_clear_error (&self->cleanup_error);
-+      return;
-+    }
-+
-+  fp_dbg ("PXAT cleanup: sending F2 abort to ensure hardware IDLE");
++  fp_dbg ("PXAT recovery: queueing F2 after command-layer inter-command delay");
 +  fpi_ssm_start (self->cleanup_ssm, pxat_cleanup_done);
-+}
-+
-+static void
-+pxat_finish_enroll (FpiDevicePxat *self,
-+                    FpDevice       *device)
-+{
-+  FpPrint *print = NULL;
-+
-+  if (self->enroll_print)
-+    print = g_object_ref (self->enroll_print);
-+
-+  self->ssm = NULL;
-+  self->operation = FPI_DEVICE_ACTION_NONE;
-+  self->last_state = 0;
-+  self->command_active = FALSE;
-+  self->enroll_slot = 0;
-+  self->enroll_print = NULL;
-+
-+  fpi_device_enroll_complete (device, print, NULL);
-+}
-+
-+static void
-+pxat_finish_verify (FpiDevicePxat *self,
-+                    FpDevice       *device)
-+{
-+  self->ssm = NULL;
-+  self->operation = FPI_DEVICE_ACTION_NONE;
-+  self->last_state = 0;
-+  self->command_active = FALSE;
-+  self->verify_print = NULL;
-+
-+  fpi_device_verify_complete (device, NULL);
-+}
-+
-+static void
-+pxat_finish_identify (FpiDevicePxat *self,
-+                      FpDevice       *device)
-+{
-+  self->ssm = NULL;
-+  self->operation = FPI_DEVICE_ACTION_NONE;
-+  self->last_state = 0;
-+  self->command_active = FALSE;
-+  self->identify_gallery = NULL;
-+
-+  fpi_device_identify_complete (device, NULL);
 +}
 +
 +static void
@@ -752,7 +940,7 @@ index 0000000..0035d69
 +  PXAT_OPEN_B1,
 +  PXAT_OPEN_B1_PARSE,
 +  PXAT_OPEN_A1,
-+  PXAT_OPEN_DONE,
++  PXAT_OPEN_A1_DONE,
 +  PXAT_OPEN_N_STATES,
 +};
 +
@@ -782,7 +970,7 @@ index 0000000..0035d69
 +      break;
 +
 +    case PXAT_OPEN_B1:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_INIT_B1, NULL, 0, TRUE);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_INIT_B1, NULL, 0, TRUE);
 +      break;
 +
 +    case PXAT_OPEN_B1_PARSE:
@@ -790,7 +978,7 @@ index 0000000..0035d69
 +        gsize len = 0;
 +        const guint8 *p = g_bytes_get_data (self->last_response, &len);
 +
-+        if (len < 17 || p[0] != PXAT_STATUS_OK)
++        if (len != 17 || p[0] != PXAT_STATUS_OK)
 +          {
 +            fpi_ssm_mark_failed (ssm,
 +                                 g_error_new (FP_DEVICE_ERROR,
@@ -799,16 +987,30 @@ index 0000000..0035d69
 +            return;
 +          }
 +
-+        fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++        fpi_ssm_next_state (ssm);
 +      }
 +      break;
 +
 +    case PXAT_OPEN_A1:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_READ_SYS_PARA, NULL, 0, TRUE);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_READ_SYS_PARA, NULL, 0, TRUE);
 +      break;
 +
-+    case PXAT_OPEN_DONE:
-+      fpi_ssm_mark_completed (ssm);
++    case PXAT_OPEN_A1_DONE:
++      {
++        gsize len = 0;
++        const guint8 *p = g_bytes_get_data (self->last_response, &len);
++
++        if (len != 39 || p[0] != PXAT_STATUS_OK)
++          {
++            fpi_ssm_mark_failed (ssm,
++                                 g_error_new (FP_DEVICE_ERROR,
++                                              FP_DEVICE_ERROR_PROTO,
++                                              "PXAT A1 system parameters are invalid"));
++            return;
++          }
++
++        fpi_ssm_mark_completed (ssm);
++      }
 +      break;
 +
 +    default:
@@ -818,12 +1020,11 @@ index 0000000..0035d69
 +
 +enum
 +{
++  PXAT_ENROLL_ABORT,
 +  PXAT_ENROLL_LIST,
 +  PXAT_ENROLL_PARSE_LIST,
-+  PXAT_ENROLL_ABORT,
-+  PXAT_ENROLL_ABORT_DELAY,
 +  PXAT_ENROLL_START,
-+  PXAT_ENROLL_START_DELAY,
++  PXAT_ENROLL_START_DONE,
 +  PXAT_ENROLL_POLL,
 +  PXAT_ENROLL_PARSE,
 +  PXAT_ENROLL_N_STATES,
@@ -835,23 +1036,25 @@ index 0000000..0035d69
 +                      GError   *error)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++  FpiDeviceAction action = self->operation;
 +
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
 +  self->ssm = NULL;
 +
-+  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
-+  if (self->cancel_requested || error != NULL)
++  if (!error)
 +    {
-+      if (!self->cleanup_error)
-+        self->cleanup_error = g_steal_pointer (&error);
-+      else
-+        g_clear_error (&error);
-+
-+      pxat_start_abort_cleanup (self, device);
++      pxat_complete_success (self, device, action);
 +      return;
 +    }
 +
++  if (!self->cleanup_error)
++    self->cleanup_error = g_steal_pointer (&error);
++  else
++    g_clear_error (&error);
++
 +  if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_enroll (self, device);
++    pxat_start_abort_cleanup (self, device);
 +}
 +
 +static void
@@ -859,16 +1062,41 @@ index 0000000..0035d69
 +                         FpDevice *device)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
-+  guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +
++  /* The host-side operation timeout is distinct from the USB transaction
++   * timeout. It ends the action; cleanup is handled by the action done path. */
++  if (self->operation_timed_out)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_TIMED_OUT,
++                                        "PXAT fingerprint operation timed out"));
++      return;
++    }
++
++  /* Cancellation may arrive while the command-layer inter-command delay is
++   * pending. Let that child finish its delay, then terminate here. */
++  if (self->cancel_requested)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_CANCELLED,
++                                        "PXAT fingerprint operation cancelled"));
++      return;
++    }
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
++    case PXAT_ENROLL_ABORT:
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
++      break;
++
 +    case PXAT_ENROLL_LIST:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_READ_INDEX, NULL, 0, TRUE);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_READ_INDEX, NULL, 0, TRUE);
 +      break;
 +
 +    case PXAT_ENROLL_PARSE_LIST:
 +      {
++        guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +        gsize len = 0;
 +        const guint8 *p = g_bytes_get_data (self->last_response, &len);
 +        guint slot;
@@ -887,6 +1115,7 @@ index 0000000..0035d69
 +          {
 +            guint bitmap_byte = slot / 8;
 +            guint bitmap_bit = slot % 8;
++
 +            if (!(p[1 + bitmap_byte] & (1u << bitmap_bit)))
 +              {
 +                found = TRUE;
@@ -919,16 +1148,8 @@ index 0000000..0035d69
 +          fp_print_set_description (self->enroll_print, description);
 +        }
 +
-+        fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++        fpi_ssm_next_state (ssm);
 +      }
-+      break;
-+
-+    case PXAT_ENROLL_ABORT:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
-+      break;
-+
-+    case PXAT_ENROLL_ABORT_DELAY:
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
 +      break;
 +
 +    case PXAT_ENROLL_START:
@@ -938,18 +1159,23 @@ index 0000000..0035d69
 +        index_data[2] = 0x00;
 +        index_data[3] = 0x00;
 +        index_data[4] = 0x00;
-+        pxat_start_cmd_subsm (ssm, device, PXAT_CMD_START_ENROLL,
-+                              index_data, sizeof index_data, TRUE);
++        pxat_start_normal_cmd (ssm,
++                               device,
++                               PXAT_CMD_START_ENROLL,
++                               index_data,
++                               sizeof index_data,
++                               TRUE);
 +      }
 +      break;
 +
-+    case PXAT_ENROLL_START_DELAY:
++    case PXAT_ENROLL_START_DONE:
++      pxat_start_operation_timeout (self, device, self->model->enroll_timeout_ms);
 +      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++      fpi_ssm_next_state (ssm);
 +      break;
 +
 +    case PXAT_ENROLL_POLL:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ENROLL_STATE, NULL, 0, FALSE);
++      pxat_start_poll_cmd (ssm, device, PXAT_CMD_ENROLL_STATE);
 +      break;
 +
 +    case PXAT_ENROLL_PARSE:
@@ -968,7 +1194,9 @@ index 0000000..0035d69
 +          }
 +
 +        state = p[0];
-+        fp_dbg ("PXAT enroll state: 0x%02x", state);
++        gboolean state_changed = (self->last_state != state);
++        if (state_changed)
++          fp_dbg ("PXAT enroll state: 0x%02x", state);
 +
 +        switch (state)
 +          {
@@ -985,7 +1213,7 @@ index 0000000..0035d69
 +          case PXAT_STATE_BAD_IMAGE_E:
 +          case PXAT_STATE_BAD_IMAGE_F:
 +            fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
-+            if (self->last_state != state)
++            if (state_changed)
 +              fpi_device_enroll_progress (device,
 +                                          0,
 +                                          NULL,
@@ -994,7 +1222,7 @@ index 0000000..0035d69
 +
 +          case PXAT_STATE_FINGER_NOT_FULL:
 +            fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
-+            if (self->last_state != state)
++            if (state_changed)
 +              fpi_device_enroll_progress (device,
 +                                          0,
 +                                          NULL,
@@ -1007,19 +1235,16 @@ index 0000000..0035d69
 +            break;
 +
 +          case PXAT_STATE_ENROLL_REDUNDANT:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_ssm_mark_failed (ssm,
 +                                 fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE));
 +            return;
 +
 +          case PXAT_STATE_ENROLL_FAIL:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_ssm_mark_failed (ssm,
 +                                 fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
 +            return;
 +
 +          case PXAT_STATE_ENROLL_ABORTED:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_ssm_mark_failed (ssm,
 +                                 g_error_new (G_IO_ERROR,
 +                                              G_IO_ERROR_TIMED_OUT,
@@ -1027,7 +1252,6 @@ index 0000000..0035d69
 +            return;
 +
 +          case PXAT_STATE_ENROLL_SUCCESS:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_device_enroll_progress (device, 1, self->enroll_print, NULL);
 +            fpi_ssm_mark_completed (ssm);
 +            return;
@@ -1037,7 +1261,7 @@ index 0000000..0035d69
 +          }
 +
 +        self->last_state = state;
-+        fpi_ssm_jump_to_state_delayed (ssm, PXAT_ENROLL_POLL, PXAT_POLL_MS);
++        fpi_ssm_jump_to_state (ssm, PXAT_ENROLL_POLL);
 +      }
 +      break;
 +
@@ -1049,9 +1273,8 @@ index 0000000..0035d69
 +enum
 +{
 +  PXAT_VERIFY_ABORT,
-+  PXAT_VERIFY_ABORT_DELAY,
 +  PXAT_VERIFY_START,
-+  PXAT_VERIFY_START_DELAY,
++  PXAT_VERIFY_START_DONE,
 +  PXAT_VERIFY_POLL,
 +  PXAT_VERIFY_PARSE,
 +  PXAT_VERIFY_N_STATES,
@@ -1063,23 +1286,25 @@ index 0000000..0035d69
 +                      GError   *error)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++  FpiDeviceAction action = self->operation;
 +
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
 +  self->ssm = NULL;
 +
-+  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
-+  if (self->cancel_requested || error != NULL)
++  if (!error)
 +    {
-+      if (!self->cleanup_error)
-+        self->cleanup_error = g_steal_pointer (&error);
-+      else
-+        g_clear_error (&error);
-+
-+      pxat_start_abort_cleanup (self, device);
++      pxat_complete_success (self, device, action);
 +      return;
 +    }
 +
++  if (!self->cleanup_error)
++    self->cleanup_error = g_steal_pointer (&error);
++  else
++    g_clear_error (&error);
++
 +  if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_verify (self, device);
++    pxat_start_abort_cleanup (self, device);
 +}
 +
 +static void
@@ -1087,20 +1312,37 @@ index 0000000..0035d69
 +                         FpDevice *device)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
-+  guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +
++  /* The host-side operation timeout is distinct from the USB transaction
++   * timeout. It ends the action; cleanup is handled by the action done path. */
++  if (self->operation_timed_out)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_TIMED_OUT,
++                                        "PXAT fingerprint operation timed out"));
++      return;
++    }
++
++  /* Cancellation may arrive while the command-layer inter-command delay is
++   * pending. Let that child finish its delay, then terminate here. */
++  if (self->cancel_requested)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_CANCELLED,
++                                        "PXAT fingerprint operation cancelled"));
++      return;
++    }
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case PXAT_VERIFY_ABORT:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
-+      break;
-+
-+    case PXAT_VERIFY_ABORT_DELAY:
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
 +      break;
 +
 +    case PXAT_VERIFY_START:
 +      {
++        guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +        guint slot;
 +        guint8 slot_byte;
 +
@@ -1113,18 +1355,25 @@ index 0000000..0035d69
 +                                              "PXAT verify print does not contain valid fpi-data"));
 +            return;
 +          }
++
 +        slot_byte = (guint8) slot;
-+        pxat_start_cmd_subsm (ssm, device, PXAT_CMD_VERIFY, &slot_byte, 1, TRUE);
++        pxat_start_normal_cmd (ssm,
++                               device,
++                               PXAT_CMD_VERIFY,
++                               &slot_byte,
++                               1,
++                               TRUE);
 +      }
 +      break;
 +
-+    case PXAT_VERIFY_START_DELAY:
++    case PXAT_VERIFY_START_DONE:
++      pxat_start_operation_timeout (self, device, self->model->verify_timeout_ms);
 +      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++      fpi_ssm_next_state (ssm);
 +      break;
 +
 +    case PXAT_VERIFY_POLL:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ENROLL_STATE, NULL, 0, FALSE);
++      pxat_start_poll_cmd (ssm, device, PXAT_CMD_ENROLL_STATE);
 +      break;
 +
 +    case PXAT_VERIFY_PARSE:
@@ -1168,18 +1417,15 @@ index 0000000..0035d69
 +            break;
 +
 +          case PXAT_STATE_VERIFY_FAIL:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
 +            fpi_ssm_mark_completed (ssm);
 +            return;
 +
 +          case PXAT_STATE_VERIFY_TIMEOUT:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
-+            fpi_device_verify_report (device,
-+                                      FPI_MATCH_ERROR,
-+                                      NULL,
-+                                      fpi_device_retry_new (PXAT_RETRY_GENERAL));
-+            fpi_ssm_mark_completed (ssm);
++            fpi_ssm_mark_failed (ssm,
++                                 g_error_new (G_IO_ERROR,
++                                              G_IO_ERROR_TIMED_OUT,
++                                              "PXAT verification timed out (sensor F3)"));
 +            return;
 +
 +          case PXAT_STATE_VERIFY_MATCH:
@@ -1189,7 +1435,6 @@ index 0000000..0035d69
 +                guint16 score = pxat_be16 (p + 3);
 +
 +                fp_dbg ("PXAT verify match: slot=%u score=%u", index, score);
-+                fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +                fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
 +                fpi_ssm_mark_completed (ssm);
 +                return;
@@ -1200,7 +1445,7 @@ index 0000000..0035d69
 +            break;
 +          }
 +
-+        fpi_ssm_jump_to_state_delayed (ssm, PXAT_VERIFY_POLL, PXAT_POLL_MS);
++        fpi_ssm_jump_to_state (ssm, PXAT_VERIFY_POLL);
 +      }
 +      break;
 +
@@ -1212,9 +1457,8 @@ index 0000000..0035d69
 +enum
 +{
 +  PXAT_IDENTIFY_ABORT,
-+  PXAT_IDENTIFY_ABORT_DELAY,
 +  PXAT_IDENTIFY_START,
-+  PXAT_IDENTIFY_START_DELAY,
++  PXAT_IDENTIFY_START_DONE,
 +  PXAT_IDENTIFY_POLL,
 +  PXAT_IDENTIFY_PARSE,
 +  PXAT_IDENTIFY_N_STATES,
@@ -1222,27 +1466,29 @@ index 0000000..0035d69
 +
 +static void
 +pxat_identify_ssm_done (FpiSsm   *ssm,
-+                        FpDevice *device,
-+                        GError   *error)
++                      FpDevice *device,
++                      GError   *error)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
++  FpiDeviceAction action = self->operation;
 +
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
 +  self->ssm = NULL;
 +
-+  /* On error, cancel, or timeout: always clean up sensor hardware with 0xF2 */
-+  if (self->cancel_requested || error != NULL)
++  if (!error)
 +    {
-+      if (!self->cleanup_error)
-+        self->cleanup_error = g_steal_pointer (&error);
-+      else
-+        g_clear_error (&error);
-+
-+      pxat_start_abort_cleanup (self, device);
++      pxat_complete_success (self, device, action);
 +      return;
 +    }
 +
++  if (!self->cleanup_error)
++    self->cleanup_error = g_steal_pointer (&error);
++  else
++    g_clear_error (&error);
++
 +  if (self->operation != FPI_DEVICE_ACTION_NONE)
-+    pxat_finish_identify (self, device);
++    pxat_start_abort_cleanup (self, device);
 +}
 +
 +static void
@@ -1250,20 +1496,37 @@ index 0000000..0035d69
 +                           FpDevice *device)
 +{
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
-+  guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +
++  /* The host-side operation timeout is distinct from the USB transaction
++   * timeout. It ends the action; cleanup is handled by the action done path. */
++  if (self->operation_timed_out)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_TIMED_OUT,
++                                        "PXAT fingerprint operation timed out"));
++      return;
++    }
++
++  /* Cancellation may arrive while the command-layer inter-command delay is
++   * pending. Let that child finish its delay, then terminate here. */
++  if (self->cancel_requested)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           g_error_new (G_IO_ERROR,
++                                        G_IO_ERROR_CANCELLED,
++                                        "PXAT fingerprint operation cancelled"));
++      return;
++    }
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case PXAT_IDENTIFY_ABORT:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
-+      break;
-+
-+    case PXAT_IDENTIFY_ABORT_DELAY:
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_ABORT, NULL, 0, TRUE);
 +      break;
 +
 +    case PXAT_IDENTIFY_START:
 +      {
++        guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +        guint8 slots[PXAT_BITMAP_BYTES * 8];
 +        gsize num_slots = 0;
 +
@@ -1281,7 +1544,9 @@ index 0000000..0035d69
 +            guint slot = 0;
 +            gboolean exists = FALSE;
 +
-+            if (!pxat_parse_print_data (print, &slot, self->model->slot_first, slot_last))
++            if (!pxat_parse_print_data (print, &slot,
++                                        self->model->slot_first,
++                                        slot_last))
 +              continue;
 +
 +            for (gsize j = 0; j < num_slots; j++)
@@ -1295,7 +1560,8 @@ index 0000000..0035d69
 +
 +            if (!exists)
 +              {
-+                if (num_slots >= sizeof (slots) || num_slots >= self->model->slot_count)
++                if (num_slots >= sizeof (slots) ||
++                    num_slots >= self->model->slot_count)
 +                  break;
 +                slots[num_slots++] = (guint8) slot;
 +              }
@@ -1310,21 +1576,23 @@ index 0000000..0035d69
 +          }
 +
 +        fp_dbg ("PXAT identify starting with %zu slots", num_slots);
-+        pxat_start_cmd_subsm (ssm, device, PXAT_CMD_VERIFY, slots, num_slots, TRUE);
++        pxat_start_normal_cmd (ssm, device, PXAT_CMD_VERIFY, slots, num_slots, TRUE);
 +      }
 +      break;
 +
-+    case PXAT_IDENTIFY_START_DELAY:
++    case PXAT_IDENTIFY_START_DONE:
++      pxat_start_operation_timeout (self, device, self->model->identify_timeout_ms);
 +      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
-+      fpi_ssm_next_state_delayed (ssm, self->model->inter_cmd_delay_ms);
++      fpi_ssm_next_state (ssm);
 +      break;
 +
 +    case PXAT_IDENTIFY_POLL:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_ENROLL_STATE, NULL, 0, FALSE);
++      pxat_start_poll_cmd (ssm, device, PXAT_CMD_ENROLL_STATE);
 +      break;
 +
 +    case PXAT_IDENTIFY_PARSE:
 +      {
++        guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
 +        gsize len = 0;
 +        const guint8 *p = g_bytes_get_data (self->last_response, &len);
 +        guint8 state;
@@ -1364,18 +1632,15 @@ index 0000000..0035d69
 +            break;
 +
 +          case PXAT_STATE_VERIFY_FAIL:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +            fpi_device_identify_report (device, NULL, NULL, NULL);
 +            fpi_ssm_mark_completed (ssm);
 +            return;
 +
 +          case PXAT_STATE_VERIFY_TIMEOUT:
-+            fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
-+            fpi_device_identify_report (device,
-+                                        NULL,
-+                                        NULL,
-+                                        fpi_device_retry_new (PXAT_RETRY_GENERAL));
-+            fpi_ssm_mark_completed (ssm);
++            fpi_ssm_mark_failed (ssm,
++                                 g_error_new (G_IO_ERROR,
++                                              G_IO_ERROR_TIMED_OUT,
++                                              "PXAT identification timed out (sensor F3)"));
 +            return;
 +
 +          case PXAT_STATE_VERIFY_MATCH:
@@ -1392,7 +1657,10 @@ index 0000000..0035d69
 +                    FpPrint *cand = g_ptr_array_index (self->identify_gallery, i);
 +                    guint cand_slot = 0;
 +
-+                    if (pxat_parse_print_data (cand, &cand_slot, self->model->slot_first, slot_last) &&
++                    if (pxat_parse_print_data (cand,
++                                               &cand_slot,
++                                               self->model->slot_first,
++                                               slot_last) &&
 +                        cand_slot == matched_index)
 +                      {
 +                        matched_print = cand;
@@ -1400,7 +1668,6 @@ index 0000000..0035d69
 +                      }
 +                  }
 +
-+                fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
 +                fpi_device_identify_report (device, matched_print, NULL, NULL);
 +                fpi_ssm_mark_completed (ssm);
 +                return;
@@ -1411,7 +1678,7 @@ index 0000000..0035d69
 +            break;
 +          }
 +
-+        fpi_ssm_jump_to_state_delayed (ssm, PXAT_IDENTIFY_POLL, PXAT_POLL_MS);
++        fpi_ssm_jump_to_state (ssm, PXAT_IDENTIFY_POLL);
 +      }
 +      break;
 +
@@ -1419,6 +1686,13 @@ index 0000000..0035d69
 +      g_assert_not_reached ();
 +    }
 +}
++
++enum
++{
++  PXAT_LIST_CMD,
++  PXAT_LIST_DONE,
++  PXAT_LIST_N_STATES,
++};
 +
 +static void
 +pxat_list_ssm_done (FpiSsm   *ssm,
@@ -1477,13 +1751,6 @@ index 0000000..0035d69
 +  fpi_device_list_complete (device, prints, NULL);
 +}
 +
-+enum
-+{
-+  PXAT_LIST_CMD,
-+  PXAT_LIST_DONE,
-+  PXAT_LIST_N_STATES,
-+};
-+
 +static void
 +pxat_list_ssm_handler (FpiSsm   *ssm,
 +                       FpDevice *device)
@@ -1491,7 +1758,7 @@ index 0000000..0035d69
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case PXAT_LIST_CMD:
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_READ_INDEX, NULL, 0, TRUE);
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_READ_INDEX, NULL, 0, TRUE);
 +      break;
 +
 +    case PXAT_LIST_DONE:
@@ -1523,31 +1790,41 @@ index 0000000..0035d69
 +pxat_delete_ssm_handler (FpiSsm   *ssm,
 +                         FpDevice *device)
 +{
-+  if (fpi_ssm_get_cur_state (ssm) == PXAT_DELETE_CMD)
-+    {
-+      FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
-+      guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
-+      FpPrint *print = NULL;
-+      guint slot;
-+      guint8 data[4];
++  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
-+      fpi_device_get_delete_data (device, &print);
-+      if (!print || !pxat_parse_print_data (print, &slot, self->model->slot_first, slot_last))
-+        {
-+          fpi_ssm_mark_failed (ssm,
-+                               g_error_new (FP_DEVICE_ERROR,
-+                                            FP_DEVICE_ERROR_DATA_INVALID,
-+                                            "PXAT delete print does not contain valid fpi-data"));
-+          return;
-+        }
-+
-+      pxat_put_be16 (data, (guint16) slot);
-+      pxat_put_be16 (data + 2, 1);
-+      pxat_start_cmd_subsm (ssm, device, PXAT_CMD_DELETE, data, sizeof data, TRUE);
-+    }
-+  else
++  switch (fpi_ssm_get_cur_state (ssm))
 +    {
++    case PXAT_DELETE_CMD:
++      {
++        guint slot_last = self->model->slot_first + self->model->slot_count - 1u;
++        FpPrint *print = NULL;
++        guint slot;
++        guint8 data[4];
++
++        fpi_device_get_delete_data (device, &print);
++        if (!print || !pxat_parse_print_data (print, &slot,
++                                              self->model->slot_first,
++                                              slot_last))
++          {
++            fpi_ssm_mark_failed (ssm,
++                                 g_error_new (FP_DEVICE_ERROR,
++                                              FP_DEVICE_ERROR_DATA_INVALID,
++                                              "PXAT delete print does not contain valid fpi-data"));
++            return;
++          }
++
++        pxat_put_be16 (data, (guint16) slot);
++        pxat_put_be16 (data + 2, 1);
++        pxat_start_normal_cmd (ssm, device, PXAT_CMD_DELETE, data, sizeof data, TRUE);
++      }
++      break;
++
++    case PXAT_DELETE_DONE:
 +      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
 +    }
 +}
 +
@@ -1571,10 +1848,19 @@ index 0000000..0035d69
 +pxat_clear_ssm_handler (FpiSsm   *ssm,
 +                        FpDevice *device)
 +{
-+  if (fpi_ssm_get_cur_state (ssm) == PXAT_CLEAR_CMD)
-+    pxat_start_cmd_subsm (ssm, device, PXAT_CMD_DELETE_ALL, NULL, 0, TRUE);
-+  else
-+    fpi_ssm_mark_completed (ssm);
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case PXAT_CLEAR_CMD:
++      pxat_start_normal_cmd (ssm, device, PXAT_CMD_DELETE_ALL, NULL, 0, TRUE);
++      break;
++
++    case PXAT_CLEAR_DONE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
 +}
 +
 +static void
@@ -1595,6 +1881,8 @@ index 0000000..0035d69
 +  FpiDevicePxat *self = FPI_DEVICE_PXAT (device);
 +
 +  self->command_active = FALSE;
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
 +  self->operation = FPI_DEVICE_ACTION_NONE;
 +  self->enroll_print = NULL;
 +  self->verify_print = NULL;
@@ -1648,8 +1936,6 @@ index 0000000..0035d69
 +
 +  self->ssm = fpi_ssm_new (device, pxat_enroll_ssm_handler, PXAT_ENROLL_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+
-+  /* Enrollment lifecycle is exclusively managed by client cancellable & sensor 0xE3 */
 +  fpi_ssm_start (self->ssm, pxat_enroll_ssm_done);
 +}
 +
@@ -1686,8 +1972,6 @@ index 0000000..0035d69
 +
 +  self->ssm = fpi_ssm_new (device, pxat_verify_ssm_handler, PXAT_VERIFY_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+
-+  /* Verify timeout is exclusively managed by fprintd/client cancellable */
 +  fpi_ssm_start (self->ssm, pxat_verify_ssm_done);
 +}
 +
@@ -1701,7 +1985,6 @@ index 0000000..0035d69
 +
 +  fpi_device_get_identify_data (device, &self->identify_gallery);
 +
-+  /* Handle empty gallery directly without touching hardware */
 +  if (!self->identify_gallery || self->identify_gallery->len == 0)
 +    {
 +      fp_dbg ("PXAT identify gallery is empty, reporting no match directly");
@@ -1720,8 +2003,6 @@ index 0000000..0035d69
 +
 +  self->ssm = fpi_ssm_new (device, pxat_identify_ssm_handler, PXAT_IDENTIFY_N_STATES);
 +  fpi_ssm_silence_debug (self->ssm);
-+
-+  /* Identify timeout is exclusively managed by fprintd/client cancellable */
 +  fpi_ssm_start (self->ssm, pxat_identify_ssm_done);
 +}
 +
@@ -1765,26 +2046,22 @@ index 0000000..0035d69
 +
 +  fp_dbg ("PXAT cancel requested by caller");
 +  self->cancel_requested = TRUE;
++  pxat_cancel_operation_timeout (self);
++  self->operation_timed_out = FALSE;
 +
 +  if (!self->cleanup_error)
 +    self->cleanup_error = g_error_new (G_IO_ERROR,
 +                                       G_IO_ERROR_CANCELLED,
 +                                       "PXAT fingerprint operation cancelled");
 +
-+  fpi_ssm_cancel_delayed_state_change (self->ssm);
-+
-+  if (self->command_active)
-+    {
-+      GCancellable *cancellable = fpi_device_get_cancellable (device);
-+      if (cancellable)
-+        g_cancellable_cancel (cancellable);
-+      return;
-+    }
-+
-+  fpi_ssm_mark_failed (self->ssm,
-+                       g_error_new (G_IO_ERROR,
-+                                    G_IO_ERROR_CANCELLED,
-+                                    "PXAT fingerprint operation cancelled"));
++  /* Cancel the USB transaction if one is actually in flight.  If the
++   * command SSM is in its inter-command delay, the child is allowed to finish
++   * that delay; the action handler then observes cancel_requested and fails. */
++  {
++    GCancellable *cancellable = fpi_device_get_cancellable (device);
++    if (cancellable)
++      g_cancellable_cancel (cancellable);
++  }
 +}
 +
 +static void
@@ -1823,6 +2100,8 @@ index 0000000..0035d69
 +  self->ssm = NULL;
 +  self->cleanup_ssm = NULL;
 +  self->command_active = FALSE;
++  self->operation_timeout_source = NULL;
++  self->operation_timed_out = FALSE;
 +  self->cancel_requested = FALSE;
 +  self->cleanup_error = NULL;
 +  self->last_response = NULL;
